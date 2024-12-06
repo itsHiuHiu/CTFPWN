@@ -1,0 +1,86 @@
+*ret2shellcode*
+Hướng làm chung là ret chương trình vào một con trỏ mà con trỏ đó đang trỏ 
+đến shellcode
+Shellcode: 
+	Là một đoạn mã chương trình được viết bằng assembly có chức năng khai
+thác...
+	Một câu lệnh assembly tương đương với một byte xác định
+->Shellcode thật chất là tập hợp các byte tương đương với một hay một chuỗi mã
+assembly xác định để lập thành chương trình khai thác
+
+Để xác định là dạng leak hay no leak cần thực hiện kiểm tra chương trình cụ thể 
+là stack có được thực thi hay không qua lệnh vmmap
+
+*No leak:
+B1: Thực hiện gdb file và nhập tràn thử để kiểm tra các dữ liệu đầu vào của các
+thanh ghi
+	Ta nhận thấy địa chỉ của thanh ghi saved rip đã bị ghi đèn khi nhập vào 
+số byte gây tràn buf và có thể xác định được rằng để chương trình thực thi shell
+ta cần overwrite địa chỉ của thanh ghi saved_rip và rax.
+	Hoặc ta dùng gadget để call rax hoặc jmp rax:
+B2: Ta dùng công cụ: ROPgadget --binary <program name> | grep rax để xác định
+gadget bởi khi ret chương trình sẽ thực hiện call/jmp rax thì sẽ chạy con trỏ(
+đưa con trỏ shellcode vào rip để đẩy lên stack)
+B3: Tiến hành viết script chứa shellcode
+	Thư viện pwntools có hỗ trợ việc lưu trữ shellcode vào một biến có cú
+pháp: <shell_var> = asm(
+		    '''
+			shellcode
+		    ''', arch = 'amd64(đối với chip intel)')
+	Ta viết script như sau:
+	Payload sẽ bao gồm ban đầu là số byte cần truyền vào chương trình để lắp
+đầy khoảng trống cần thiết trong buf
+	*Ví dụ: lấy từ bof5 của JHTpwner 
+Ta có :buf = 524 nhưng hàm read buf cho phép ta nhập vào 544 bytes
+       kèm theo đó là một biến lưu tên người dùng không có lổ hỏng nhưng dữ liệu
+của biến trên được lưu vào thanh ghi rax (sau khi đã debug)
+	-Thì ta cần gửi vào 536 byte để còn 8bytes chính là 8bytes để ghi
+đè lên địa chỉ lưu trong thanh ghi saved_rip 
+	-Lúc này payload sẽ được thêm vào kèm theo với p64(<địa chỉ call/jmp_rax>)
+và ta có: payload = b'a'*536 + p64(call_rax)
+	-Tuy nhiên ta cần xét đến việc ghi đè địa chỉ của thanh ghi rax và ta tiến
+hành bước nhập vào địa chỉ của shellcode đã viết trước đó ở bước nhập tên
+Như vậy ta có một script khai thác như sau:
+shellcode = asm(
+	    '''
+	    <shellcode>
+	    ''',arch='amd64')
+call_rax = <gadget_address>
+p.send(shellcode)
+payload = b'a'*536 + p64(call_rax)
+p.send(payload)
+B4: Tiến hành chạy script và sử dụng kĩ thuật debug động để kiểm tra xem đã khai thác
+được chương trình chưa. 
+	Để kiểm tra xem gadget có được truyền vào đúng hay chưa ta tiến hành kiểm tra
+địa chỉ đang trỏ đến call_rax bằng lệnh: x/10i <address> với i là instruction. 
+Khi đó trên màn hình sẽ hiển thị các mã assembly đã được viết trước đó.
+*Bởi vì từ đầu đã kiểm tra thấy rằng stack thực thi được nên ta call_rax thì shellcode
+sẽ được chạy như một chương trình 
+*Lưu ý khi viết shellcode: ta sẽ tận dụng directory "/bin/sh" của linux bởi đây là thư
+mục chứa các hàm của linux và khi ta thành công ret vào thư mục này thì ta có thể toàn
+quyền điểu khiển chương trình và khai thác theo ý muốn.
+
+*Leak 
+Checksec ta thấy rằng stack có thể thực thi được nên ta sẽ có ý tưởng là sẽ đưa shellcode
+lên stack và leak địa chỉ của stack.
+
+Stage 1: Leak stack addr
+-Đọc ida hàm get_name ta nhận thấy ở đây có một lỗ hỏng để leak được địa chỉ:
++Hàm read() được gọi và đọc đủ dữ liệu của buf nhưng ta nhận thấy rằng hàm read đọc loại 
+bỏ đi null byte và khi ta nhập dữ liệu vào hàm trên (ví dụ ta sẽ nhập 8 byte trong đó có 
+7 byte chữ và 1 byte enter) thì khi đó chuỗi ta nhập vào sẽ được nối với chuỗi địa chỉ của 
+instruction tiếp theo trong stack. Từ đó ta có cơ sở để leak được địa chỉ của stack chính 
+là overwrite số byte đến khi chạm đến địa chỉ của thanh ghi rbp và khi đó byte enter sẽ bị 
+lược bỏ và nối sau đó là địa chỉ của stack (được lưu trong rbp).
+
+-Ta có 2 option để đưa shellcode vào:
+1.Ta sẽ input shellcode trực tiếp từ read() nhưng chương trình sẽ thực hiện lại hàm main vì
+ta không điều khiển được saved rip. -> chuỗi ta nhập vào sẽ thay đổi.
+2.Khi đã lấy được địa chỉ stack, ta sẽ ghi đè nó vào thanh ghi saved rip để đưa shellcode 
+lên stack.
+-> Ta chọn option 2. Vì khi nó return thì nó không làm gì nên địa chỉ các phần tử trong stack
+sẽ không bị ảnh hưởng.
+#Lưu ý: khi ta đã điều khiển được saved rip của hàm nào thì mình nhập shellcode của hàm đó.
+		return vào con trỏ trỏ đến shellcode.
+-Sử dụng lệnh p/x <addr1> - <addr2> để tính khoảng cách giữa 2 địa chỉ (giữa stack_leak đến
+địa chỉ của shellcode)
