@@ -1,0 +1,84 @@
+*ret2libc
+Đặc điểm chung là tồn tại lỗi bof tuy nhiên chúng ta sẽ không
+được cung cấp một hàm nào để ret vào, tạo shell hay khai thác.
+->Để giải quyết, chúng ta cần tự tạo ra cách để ta khai thác.
+
+*GDB
+-Đầu tiên ta cần dùng gdb để nhập dữ liệu để tìm offset sau đó
+xác định địa chỉ libc cần leak ra bởi khi libc được leak địa
+chỉ thì ta có thể tìm được địa chỉ của hàm system từ đó ta thực
+thi hàm system("/bin/sh") từ đó tạo ra shell.
+->Vậy hướng làm bài của chúng ta là overwrite và leak địa chỉ của
+libc, từ libc ta tìm được địa chỉ hàm system từ đó ta sẽ điều khiển
+hàm system để thực thi lệnh system("/bin/sh") và tạo shell.
+
+*GDB
+-Sử dụng lệnh vmmap ta thấy rằng địa chỉ binary đang tĩnh và địa
+chỉ libc đang động. Vậy ta cần phải leak địa chỉ nguồn/ gốc của
+libc.
+-Sử dụng lệnh checksec ta thấy rằng thông thường đối với các dạng
+bài bof thì canary sẽ không được bật bởi canary là một phương pháp
+để phòng chống overflow và canary thường sẽ nằm trước saved_rbp và
+saved_rip.
+*(Canary bản chất sẽ ở được đưa lên stack và nằm ở trước saved_rbp
+và saved_rip. Khi dữ liệu bị tràn xuống phần dưới sẽ làm các byte 
+của canary thay đổi và ở cuối của mỗi hàm đều có sự so sánh giữa
+canary cũ và canary sau khi input và nếu không giống nhau chương 
+trình sẽ lập tức exit.)
+-Khi nhập vào dữ liệu ta để ý thấy hàm put chỉ có 1 đối số duy nhất
+và nhìn gdb ta thấy được rằng đối số của put đang được lưu trong 
+thanh ghi rsi(arg2) và ở dạng con trỏ trỏ đến dữ liệu mà ta nhập
+vào và nếu ta đưa địa chỉ con trỏ đó xuống thanh ghi rdi(arg1) thì
+nó sẽ in ra được toàn bộ dữ liệu mà ta nhập vào.
+
+*Khái niệm mới: ROT và PLT
+-GOT: Globa offset table: là nơi chứa địa chỉ các hàm của libc
+Ví dụ: hàm put là một hàm của libc và mang địa chỉ của libc và
+không phải là hàm của binary.
+->Ta có một lệnh mới đó là got để xem các địa chỉ của hàm của 
+libc tồn tại trong binary và khi đó ta thấy rằng các hàm thuộc
+libc có 2 địa chỉ ở format: [addr1] <func_name@GLIBC_version> -> <addr2>
+Với addr1 là địa chỉ GOT và addr2 là địa chỉ của hàm trong libc.
+(<func_name@got> = addr1 | <func_name@GLIBC> = addr2)
+Nếu ta dùng lệnh x/xg trên địa chỉ got của hàm thì ta sẽ được
+địa chỉ libc của hàm đó.
+
+-PLT: Procedure Linkage Table: Thực thi hàm được chứa ở GOT.
+
+->Tóm lại PLT là hàm để thực thi còn GOT là địa chỉ để chứa.
+
+*GDB
+-Sau khi đã tìm hiểu về 2 khái niệm thì ta nhận thấy địa chỉ GOT 
+của puts đang là địa chỉ tĩnh và nếu ta có thể đưa địa chỉ GOT này
+vào thanh ghi rdi(arg1) và ta thực thi lệnh puts thì khi đó ta đang
+thực thi puts@plt (khi đó chương trình sẽ thực thi địa chỉ libc của
+puts).
+-Vậy ta cần leak địa chỉ thì ta sẽ sử dụng các gadget.
++Tiến hành sử dụng lệnh ROPgadget --binary <binary_file> | grep "<gadget_name>"
++Mục tiêu ta là điều khiển được thanh ghi rdi vậy nên ở đây ta sẽ tìm
+gadget liên quan đến rdi và ta sẽ tìm gadget "pop rdi". Và ta 
+tìm được hàm ret của pop rdi.Sau khi có địa chỉ của pop rdi thì 
+ta sẽ tiến hành thiết lập thanh ghi rdi thành địa chỉ của puts@GOT.
+
+-Tiến hành viết script: (*Script)
++Đầu tiên ta nhập vào số byte theo offset (ở đây là 88)
++Ta thiết lập biến lưu trữ địa chỉ rdi và payload sẽ được thêm vào
+bằng p64 của pop rdi + p64 của put@got (vì ta đã load file binary lên
+nên ta có thể gọi địa chỉ hàm puts@got thông qua p64(exe.got['put'])) 
+và kế đến là của hàm puts@plt.
+
+(Để xem được một hàm PLT hoạt động như thế nào ta sử dụng lệnh x/3i +
+<got_addr> của hàm đó. Màn hình sẽ hiển thị quá trình hoạt động.)
+
+*Script
+-Vì đây là hàm read nên ta chỉ cần sendafter. Tiến hành cho mô phỏng 
+truyền dữ liệu vào thực thi chương trình.
+-Khi đó ta thấy được có 6 byte được in ra và chương trình end ngay lập
+tức-> để chương trình chạy lại thì ta cho nó nhảy vào hàm main: payload +=
+p64(exe.sym['main']). Đến lúc này ta vừa leak được địa chỉ mà ta vừa cho
+chương trình chạy lại lần nữa và lúc này ta nhập dữ liệu vào thì ta sẽ được
+quyền điều khiển.
+-Ở đây ta tiến hành nhận thêm 6 byte được leak ra(Lưu ý: khi ta nhận byte
+something: \n phải có thêm byte \n vì nếu không khi ta nhận 6 byte địa chỉ
+thì sẽ bị mất 1 byte cuối của địa chỉ). u64(p.recv(6) + b'\0\0') (phải là địa
+chỉ 8 byte nên ta thêm 2 byte 0 vào) và gán các byte vừa nhận vào libc_leak.
