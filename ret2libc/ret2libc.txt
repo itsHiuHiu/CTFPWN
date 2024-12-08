@@ -1,0 +1,122 @@
+*ret2libc
+Đặc điểm chung là tồn tại lỗi bof tuy nhiên chúng ta sẽ không được cung cấp một hàm nào để ret vào, tạo
+shell hay khai thác.
+->Để giải quyết, chúng ta cần tự tạo ra cách để ta khai thác.
+
+*GDB
+-Đầu tiên ta cần dùng gdb để nhập dữ liệu để tìm offset sau đó xác định địa chỉ libc cần leak ra bởi khi
+libc được leak địa chỉ thì ta có thể tìm được địa chỉ của hàm system từ đó ta thực thi hàm system("/bin/sh")
+từ đó tạo ra shell.
+->Vậy hướng làm bài của chúng ta là overwrite và leak địa chỉ của libc, từ libc ta tìm được địa chỉ hàm system
+từ đó ta sẽ điều khiển hàm system để thực thi lệnh system("/bin/sh") và tạo shell.
+
+#Stage 1: Leak địa chỉ libc
+
+*GDB
+-Sử dụng lệnh vmmap ta thấy rằng địa chỉ binary đang tĩnh và địa chỉ libc đang động. Vậy ta cần phải leak địa
+chỉ nguồn/ gốc của libc.
+-Sử dụng lệnh checksec ta thấy rằng thông thường đối với các dạng bài bof thì canary sẽ không được bật bởi canary
+là một phương pháp để phòng chống overflow và canary thường sẽ nằm trước saved_rbp và saved_rip.
+*(Canary bản chất sẽ ở được đưa lên stack và nằm ở trước saved_rbp và saved_rip. Khi dữ liệu bị tràn xuống phần
+dưới sẽ làm các byte của canary thay đổi và ở cuối của mỗi hàm đều có sự so sánh giữa canary cũ và canary sau khi
+input và nếu không giống nhau chương trình sẽ lập tức exit.)
+-Khi nhập vào dữ liệu ta để ý thấy hàm put chỉ có 1 đối số duy nhất và nhìn gdb ta thấy được rằng đối số của put
+đang được lưu trong thanh ghi rsi(arg2) và ở dạng con trỏ trỏ đến dữ liệu mà ta nhập vào và nếu ta đưa địa chỉ con
+trỏ đó xuống thanh ghi rdi(arg1) thì nó sẽ in ra được toàn bộ dữ liệu mà ta nhập vào.
+
+*Khái niệm mới: ROT và PLT
+-GOT: Globa offset table: là nơi chứa địa chỉ các hàm của libc
+Ví dụ: hàm put là một hàm của libc và mang địa chỉ của libc và không phải là hàm của binary.
+->Ta có một lệnh mới đó là got để xem các địa chỉ của hàm của libc tồn tại trong binary và khi đó ta thấy rằng các
+hàm thuộc libc có 2 địa chỉ ở format: [addr1] <func_name@GLIBC_version> -> <addr2>
+Với addr1 là địa chỉ GOT và addr2 là địa chỉ của hàm trong libc.
+(<func_name@got> = addr1 | <func_name@GLIBC> = addr2)
+Nếu ta dùng lệnh x/xg trên địa chỉ got của hàm thì ta sẽ được địa chỉ libc của hàm đó.
+
+-PLT: Procedure Linkage Table: Thực thi hàm được chứa ở GOT.
+
+->Tóm lại PLT là hàm để thực thi còn GOT là địa chỉ để chứa.
+
+*GDB
+-Sau khi đã tìm hiểu về 2 khái niệm thì ta nhận thấy địa chỉ GOT của puts đang là địa chỉ tĩnh và nếu ta có thể đưa
+địa chỉ GOT này vào thanh ghi rdi(arg1) và ta thực thi lệnh puts thì khi đó ta đang thực thi puts@plt (khi đó chương
+trình sẽ thực thi địa chỉ libc của puts).
+-Vậy ta cần leak địa chỉ thì ta sẽ sử dụng các gadget.
++Tiến hành sử dụng lệnh ROPgadget --binary <binary_file> | grep "<gadget_name>"
++Mục tiêu ta là điều khiển được thanh ghi rdi vậy nên ở đây ta sẽ tìm gadget liên quan đến rdi và ta sẽ tìm gadget 
+"pop rdi". Và ta tìm được hàm ret của pop rdi.Sau khi có địa chỉ của pop rdi thì ta sẽ tiến hành thiết lập thanh ghi
+rdi thành địa chỉ của puts@GOT.
+
+-Tiến hành viết script: (*Script)
++Đầu tiên ta nhập vào số byte theo offset (ở đây là 88)
++Ta thiết lập biến lưu trữ địa chỉ rdi và payload sẽ được thêm vào bằng p64 của pop rdi + p64 của put@got (vì ta đã
+load file binary lên nên ta có thể gọi địa chỉ hàm puts@got thông qua p64(exe.got['put'])) và kế đến là của hàm puts@plt.
+
+(Để xem được một hàm PLT hoạt động như thế nào ta sử dụng lệnh x/3i +<got_addr> của hàm đó. Màn hình sẽ hiển thị quá
+trình hoạt động.)
+
+*Script
+-Vì đây là hàm read nên ta chỉ cần sendafter. Tiến hành cho mô phỏng truyền dữ liệu vào thực thi chương trình.
+-Khi đó ta thấy được có 6 byte được in ra và chương trình end ngay lập tức-> để chương trình chạy lại thì ta cho nó
+nhảy vào hàm main: payload += p64(exe.sym['main']). Đến lúc này ta vừa leak được địa chỉ mà ta vừa cho chương trình chạy
+lại lần nữa và lúc này ta nhập dữ liệu vào thì ta sẽ được quyền điều khiển.
+-Ở đây ta tiến hành nhận thêm 6 byte được leak ra(Lưu ý: khi ta nhận byte something: \n phải có thêm byte \n vì nếu không
+khi ta nhận 6 byte địa chỉ thì sẽ bị mất 1 byte cuối của địa chỉ). u64(p.recv(6) + b'\0\0') 
+(phải là địa chỉ 8 byte nên ta thêm 2 byte 0 vào) và gán các byte vừa nhận vào libc_leak.
+
+*Note:
+-Địa chỉ dù có động thì 3 byte cuối vẫn cố định. Tuy nhiên địa chỉ local và địa chỉ khi kết nối đến một server nào đó
+thì 3 byte cuối có thể khác hoàn toàn. (Tức là 3 byte cuối chỉ cố định trong nội bộ một máy chủ hoặc local).
+
+*Script
+-Ta sẽ khảo sát điều trên thông qua việc kết nối đến một server. Khi chạy script ta thấy rằng địa chỉ hoàn toàn khác
+với địa chỉ local vì vậy nên ta cần xác định địa chỉ libc tương tự với libc của server nào thông qua trang web: libc.rip.
+-Ở đây ta đang muốn leak địa chỉ của hàm puts vậy nên ở phần symbol name ta nhập 'puts' và ở phần address ta sẽ
+nhập địa chỉ vừa leak được.
+-Kết quả trả về cho ta một số libc có khả năng (vì những libc này thì hàm puts của nó đều kết thúc với 3 byte cuối
+giống nhau của leak) và ta bắt buộc phải thử từng libc.
+-Ta download libc về và đưa vào thư mục có chứa challenge hiện tại. Ta sử dụng công cụ pwninit để tự động liên kết
+file binary và libc lại với nhau.
+
+*Note
+-Mỗi hệ điều hành xài một phiên bản libc khác nhau nên bắt buộc khi ta đã leak địa chỉ rồi thỉ phải tìm cho đúng cái
+libc đó. Khi đó việc gủi dữ liệu mới được chính xác.
+
+*Script
+-Khi đó trong script ta tiến hành chạy file libc: libc = ELF('./<file_name>',checksec=False).
+-Và khi ta cho chạy thử thì thay vì chương trình chạy libc local thì chạy libc của server.
+
+*GDB
+-Và để khai thác tiếp ta cần xác định địa chỉ base(địa chỉ nhỏ nhất) của file ta load lên được.
+-Ta sử dụng lệnh vm libc6 để xem các khoảng chứa địa chỉ thì ta thấy rằng hàm puts là hàm thực thi được nên nó sẽ
+nằm ở trong khoảng địa chỉ thực thi được.
+
+*Script
+-Ta muốn tìm địa chỉ base nên trong script ta sẽ khai báo một biến libc.address với giá trị là:
+libc_leak - libc.sym['puts](ta có thể gọi sym là vì ta đã load file libc lên trước đó rồi).
+-Ta cho in ra màn hình thêm địa chỉ base : log.info('Libc base: ' + hex(libc.address)).
+-> Đến đây ta đã hoàn thành xong stage 1 đó là leak địa chỉ libc.
+
+#Stage2: Tạo shell
+
+*Script
+-Lúc này chương trình của chúng ta đã trở lại vào hàm main, lúc này kích thước dữ liệu nhập vào là giống nhau
+(offset = 88 bytes) nên ta copy lại payload bên trên.
+-Do địa chỉ libc đã có sẵn chuỗi /bin/sh rồi nên ta không cần gọi hàm để nhập chuỗi vào rồi mới tạo shell mà ta sẽ
+đưa thẳng chuỗi đó vào trong script: payload += next(libc.search(b'/bin/sh')) (đây là câu lệnh giúp ta lấy được địa
+chỉ đang chứa chuỗi /bin/sh)
+-Mục tiêu của ta là thực thi hàm system với arg1 là chuỗi /bin/sh được load lên dưới dạng con trỏ và được đưa vào rdi
+-Ta cho thực thi chương trình và shell được tạo thành công.
+
+*Note
+-Libc.address thực chất là offset của libc_leak và libc_base vì khi đó libc_base đang bằng 0 và giả sử libc_base đang
+bằng 1 thì khi đó libc_leak sẽ tự cộng thêm 1 và đó là sự thuận tiện khi ta load file libc lên.
+
+*Script
+-Khi ta cho chạy thử trên server thì khi thực thì ta lấy được flag.
+
+=>Challenge hoàn thành.
+
+*Tổng kết
+-Kỹ thuật ret2libc bao gồm 2 bước chính đó là Leak địa chỉ libc và tạo shell.
+-Là một kỹ thuật phổ biến trong thực tế cần đụng đặc biệt nhiều vào địa chỉ libc.
